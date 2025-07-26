@@ -1,0 +1,145 @@
+//run server.c as:
+	gcc -o server server.c -lpthread -L. -lmsocket
+ 	./server
+//run client.c as:
+	gcc -o client client.c -lpthread -L. -lmsocket
+	./client
+
+Data structures in mysocket.c and mysocket.h:
+
+typedef struct msg{
+	void *buff;
+	int len;
+}message;
+
+All the messages sent/received are stored in above structure
+The actual bytes that are sent/received are stored in buff
+The number of bytes in buff is stored in len
+
+typedef struct table_{
+	message **entries;
+	int cnt;
+	int in;
+	int out;
+}table;
+
+A send/recv table consists of an array of message* (pointer to struct msg)
+Basically "entries" is a circular buffer (queue) which stores atmost 10 message pointers
+This ensures FIFO delivery of messages
+cnt: no. of message pointers currently stored in entries
+in: next index in entries to which a thread must write
+out: next index in entries from which a thread must read
+
+The reason for storing pointers to struct msg in the table and not the struct itself is that the tables
+are shared amongst processes. So we have locks to ensure mutual exclusion. In order to ensure that 
+any reader/writer does not keep the lock with itself for more than O(1) time, we use pointers
+
+The reader will just copy pointer from entries array, and then update cnt,out; all O(1) operations
+The writer will just store pointer into the entries array, and then update cnt,in; all O(1) operations
+
+
+send_table,recv_table:Global table pointers for send and recv tables.
+
+send_lock,recv_lock,fd_lock:
+	send_lock is mutex lock over send_table
+	recv_lock is mutex lock over recv_table
+	fd_lock is mutex lock over use_sockfd
+
+S_tid,R_tid:Thread ids of threads S and R
+
+cleared: initialized to 0 in my_socket, set to 1 on first call to my_close
+		 it denotes whether threads and shared tables have been cleared or not
+		 if server calls my_close() twice, once for sockfd and once for newsockfd, then this will clear threads,tables only once
+
+use_sockfd: sockfd on which communication takes place,in client it is set by my_connect call,
+			in server it is set by my_accept call, initialized to -1 in my_socket
+			this is needed because in server send/recv calls are made using newsockfd returned by accept() call
+			but in client send/recv calls are made using sockfd returned by socket() call
+			the library doesn't know whether the calls are made by client or server
+			so use_sockfd is maintained and is set by my_accept() in server and my_connect() in client
+
+//parameters of below functions are same as standard calls
+//return values same as that of corresponding standard call
+my_socket(): Creates a new socket, mallocs send_table,recv_table,mallocs send_table->entries and 
+			 recv_table->entries to array to 10 message pointers. Also initializes fd_lock,send_lock
+			 and recv_lock. Sets use_sockfd to -1. Creates threads S,R. Returns sockfd
+
+my_bind(): binds socket to struct sockaddr* 
+my_listen(): wrapper over listen() call, made by server
+my_accept(): Used by server, makes accept call to accept client request and gets newsockfd. 
+			 Then it sets use_sockfd to newsockfd.
+my_connect(): Used by client to connect to server via sockfd(function parameter). It sets use_sockfd to sockfd.
+
+my_send(int sockfd,const void *buf,size_t n,int flags): Send n bytes stored in buf via sockfd.
+my_send waits as long as the send_table->entries is full
+Once there is a free entry, it copies the message to send_table->entries (described in detail later)
+It then returns, actual send() calls made by thread S
+
+my_recv(int sockfd,void *buf,size_t n,int flags): Receive message stored in recv_table if any and copy to buf
+If n<message length, extra bytes are discarded
+If n>message length, on message length number of bytes copied to buf
+my_recv waits as long as recv_table->entries is empty
+Once some message is there in the recv_table, it copies the message to buf and then returns number of bytes copied
+Actual recv() calls made by thread R
+
+
+my_close(int sockfd): closes sockfd, cleans up tables,buffers and kills threads 
+
+void send_in_chunks(int sockfd,void *buff,int num_bytes): 
+	this function sends num_bytes number of bytes stored in buff 
+	sending is done in chunks of size CHUNK_SIZE
+	sockfd is the socket descriptor to be used
+
+void recv_in_chunks(int sockfd,void *buff,int len):
+	this function receives len number of bytes in chunks of size CHUNK_SIZE via sockfd
+	these bytes are stored in buff
+
+void clean_table(table *t): deallocates t->entries[i].buff, t->entries[i] for each index i present in table
+							deallocates t
+							basically does a proper clean up of t, t->entries, and all messages stored in t->entries 
+
+void *S_runner(void *param): runner for thread S
+S waits till use_sockfd is not set by my_accept/my_connect
+Now S waits till there is a message to be sent in send_table
+Once there is a message to send, it first copies the appropriate message pointer from entries array to message *msg
+Encoding of message is such that first 4 bytes contain length of message say len
+Next len bytes contain actual bytes of the message to be sent
+So in total len+4 bytes are sent in chunks using send_in_chunks function
+The above encoding of message needs to be done by thread S
+Now the pointer msg is no longer needed, so we free msg->buff and msg both
+Again S waits till send_table->entries in empty
+
+void *R_runner(void *param): runner for thread R
+R waits till use_sockfd is not set by my_accept/my_connect
+Now R waits in recv() call
+R first receives the first 4 bytes of data via recv_in_chunks() so as to know message length say len
+R allocates a buffer to store len bytes of data
+It also allocates a new struct message say msg whose buff is same as buffer and length is len
+Now R receives len bytes of data via recv_in_chunks()
+Once data has been received, R waits till recv_table->entries is full
+It then copies message *msg to recv_table->entries at appropriate index
+Again R waits in recv() call
+
+my_send(int sockfd,const void *buf,size_t n,int flags) call execution steps:
+	my_send waits till send_table->entries is full
+	Since the send_table->entries is just an array of pointers, the allocation for the message is done by my_send
+	my_send allocates a new message msg
+	It allocates n bytes for msg->buff 
+	if n>5000, n is set to 5000
+	msg->len is set to n
+	Then msg is copied to send_table at appropriate index
+	send_table->cnt and send_table->in are updated
+	Then n is returned
+	Now the actual send() calls are made by thread S are stated above
+
+my_recv(int sockfd,void *buf,size_t n,int flags) call execution steps:
+	my_recv call waits till there is message to read in recv_table
+	R makes recv() calls and copies the message(s) to recv_table->entries as described above
+	Only after above step there will be one or more entries in recv_table
+	Now the message* msg is copied from appropriate index in recv_table->entries
+	recv_table->cnt and recv_table->out are updated
+	If msg->len < n, n is set to msg->len
+	n bytes are copied from msg->buff to buf
+	Since msg->buff and msg we dynamically allocated by my_send previously we need to free these spaces
+	So we deallocate msg->buff and msg
+	Lastly n is returned
